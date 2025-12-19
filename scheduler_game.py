@@ -1,41 +1,125 @@
 import dash
-from dash import dcc, html, Input, Output, State, ctx
+from dash import dcc, html, Input, Output, State, ctx, ALL
 import plotly.express as px
 import pandas as pd
 import random
+import base64
 
 # --- CONFIGURATION ---
-QUANTUM = 3  # Temps max par tour si Round Robin activé
-IO_PROBABILITY = 0.15
-MAX_IO_DURATION = 3
+QUANTUM = 3
+MAX_IO_DURATION = 6
+INITIAL_LIVES = 3
 
 
-# --- MOTEUR LOGIQUE ---
+# --- FONCTIONS UTILITAIRES ---
 
-def generate_initial_state():
+def parse_uploaded_file(contents):
+    """Lit le fichier texte et retourne la liste des processus."""
+    try:
+        content_type, content_string = contents.split(',')
+        decoded = base64.b64decode(content_string)
+        text = decoded.decode('utf-8')
+
+        processes = []
+        lines = text.strip().split('\n')
+
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) >= 6:
+                nom = parts[0]
+                arr = int(parts[1])
+                burst = int(parts[2])
+                io_start = int(parts[3])
+                io_dur = int(parts[4])
+                prio = int(parts[5])
+
+                io_plan = []
+                if io_start >= 0:
+                    io_plan = [io_start]
+
+                processes.append({
+                    "pid": nom,
+                    "arrival_time": arr,
+                    "burst_time": burst,
+                    "remaining_time": burst,
+                    "executed_time": 0,
+                    "io_plan": io_plan,
+                    "io_duration_fixed": io_dur,
+                    "priority": prio,
+                    "state": "FUTURE",
+                    "wait_time_remaining": 0,
+                    "consecutive_cpu": 0,
+                    "just_finished": False
+                })
+
+        if processes:
+            min_arr = min(p["arrival_time"] for p in processes)
+            for p in processes:
+                p["arrival_time"] -= min_arr
+                if p["arrival_time"] == 0:
+                    p["state"] = "READY"
+
+        return processes
+    except Exception as e:
+        print(f"Erreur lecture fichier : {e}")
+        return None
+
+
+def generate_random_processes(count=6):
     processes = []
-    for i in range(6):
+    for i in range(count):
+        burst = random.randint(5, 15)
+        nb_io = random.choice([0, 0, 1, 1, 2])
+        io_plan = []
+        if nb_io > 0 and burst > 2:
+            possible_ticks = range(1, burst)
+            try:
+                io_plan = sorted(random.sample(possible_ticks, nb_io))
+            except ValueError:
+                io_plan = []
+
         processes.append({
             "pid": f"P{i + 1}",
             "arrival_time": random.randint(0, 5),
-            "burst_time": random.randint(4, 10),
-            "remaining_time": 0,
+            "burst_time": burst,
+            "remaining_time": burst,
+            "executed_time": 0,
+            "io_plan": io_plan,
+            "io_duration_fixed": None,
             "priority": random.randint(1, 10),
             "state": "FUTURE",
             "wait_time_remaining": 0,
-            "consecutive_cpu": 0
+            "consecutive_cpu": 0,
+            "just_finished": False
         })
-        processes[-1]["remaining_time"] = processes[-1]["burst_time"]
+
+    if not any(p["arrival_time"] == 0 for p in processes):
+        processes[0]["arrival_time"] = 0
+    for p in processes:
+        if p["arrival_time"] == 0: p["state"] = "READY"
+
+    return processes
+
+
+def generate_initial_state(processes=None, count=6):
+    if processes is None:
+        processes = generate_random_processes(count)
 
     return {
         "processes": processes,
+        "initial_setup": processes,  # Sauvegarde pour le Reset exact
         "current_time": 0,
         "history": [],
         "game_over": False,
         "rr_queue": [],
-        "log": ["⚙️ Configurez les règles et jouez !"]
+        "score": 0,
+        "lives": INITIAL_LIVES,
+        "log": [f"⚙️ Nouvelle partie générée avec {len(processes)} processus."],
+        "last_pid": None
     }
 
+
+# --- MOTEUR DE JEU ---
 
 def process_step(game_state, selected_pid=None, mode="MANUAL", rules=[]):
     processes = game_state["processes"]
@@ -43,394 +127,335 @@ def process_step(game_state, selected_pid=None, mode="MANUAL", rules=[]):
     history = game_state["history"]
     log = game_state["log"]
     rr_queue = game_state["rr_queue"]
+    score = game_state.get("score", 0)
+    lives = game_state.get("lives", INITIAL_LIVES)
 
-    # --- 0. DECHIFFRAGE DES REGLES ---
-    use_priority = 'PRIO' in rules
-    allow_preemption = 'PREEMPT' in rules
-    use_rr = 'RR' in rules
+    # 0. RESET ANIM
+    for p in processes: p["just_finished"] = False
 
-    # --- 1. GESTION DES ETATS (Mise à jour préliminaire) ---
-    # On ne fait avancer le temps que SI l'action est validée.
-    # Mais on doit d'abord savoir qui est Ready pour valider le choix.
+    # 1. MISE A JOUR TEMPORELLE (AVANT DÉCISION)
+    rr_queue = [pid for pid in rr_queue if any(p['pid'] == pid and p['state'] != "TERMINATED" for p in processes)]
 
-    # Copie temporaire pour analyse (on ne modifie pas encore l'état réel)
-    temp_ready = []
-    running_proc = None
-
+    # a. Arrivées
     for p in processes:
-        # Check running actuel (avant ce tick)
-        if p["state"] == "RUNNING":
-            running_proc = p
-
-        # Simulation arrivée
-        is_ready = p["state"] == "READY"
-        if p["state"] == "FUTURE" and p["arrival_time"] <= current_time:
-            is_ready = True
-        # Simulation retour E/S (Approximation pour la validation)
-        if p["state"] == "WAITING" and p["wait_time_remaining"] <= 1:
-            is_ready = True
-
-        if is_ready or p["state"] == "RUNNING":
-            temp_ready.append(p)
-
-    unfinished = [p for p in processes if p["state"] != "TERMINATED"]
-    if not unfinished:
-        game_state["game_over"] = True
-        log.append("🏆 TOUS LES PROCESSUS SONT TERMINÉS !")
-        return game_state
-
-    # --- 2. LOGIQUE DE VALIDATION (MODE MANUEL) ---
-    chosen_proc = None
-    error_msg = None
-
-    if mode == "MANUAL":
-        # Le joueur veut exécuter selected_pid. A-t-il le droit ?
-
-        # Cas 1 : CPU IDLE (Aucun choix)
-        if not selected_pid:
-            # Si des processus sont prêts, il n'a pas le droit de rien faire (sauf si on considère l'IDLE comme valide, ici on force le travail)
-            if any(p["state"] in ["READY", "RUNNING"] for p in processes if p["arrival_time"] <= current_time):
-                # On autorise l'IDLE seulement si on veut, mais ici on va juste dire "Rien sélectionné"
-                pass
-        else:
-            candidate = next((p for p in processes if p["pid"] == selected_pid), None)
-
-            # Vérif 1: Le processus est-il prêt ?
-            if not candidate or candidate not in temp_ready:
-                error_msg = f"⛔ {selected_pid} n'est pas prêt !"
-
-            # Vérif 2: NON-PRÉEMPTION
-            elif not allow_preemption and running_proc and running_proc["state"] != "TERMINATED" and running_proc[
-                "state"] != "WAITING" and candidate["pid"] != running_proc["pid"]:
-                error_msg = f"⛔ NON-PRÉEMPTION : Vous devez finir {running_proc['pid']} !"
-
-            # Vérif 3: PRIORITÉ
-            elif use_priority:
-                # Trouver la priorité max parmi les prêts
-                max_prio = max([p["priority"] for p in temp_ready]) if temp_ready else 0
-                if candidate["priority"] < max_prio:
-                    # On cherche qui a la max prio pour l'afficher
-                    better = next(p for p in temp_ready if p["priority"] == max_prio)
-                    error_msg = f"⛔ PRIORITÉ : {better['pid']} est prioritaire ({better['priority']}) !"
-
-            if not error_msg:
-                chosen_proc = candidate
-
-    else:  # MODE AUTO (L'IA respecte toujours les règles)
-        # (Même logique que précédemment pour l'IA)
-        real_ready = []
-        # On doit refaire la passe propre des états pour l'IA
-        # ... Simplification : l'IA joue après la mise à jour des états ci-dessous
-        pass
-
-        # SI ERREUR EN MANUEL : ON STOPPE TOUT
-    if error_msg:
-        log.append(error_msg)
-        game_state["log"] = log[-6:]
-        return game_state  # On retourne l'état SANS avancer le temps
-
-    # --- 3. MISE A JOUR REELLE DU TEMPS ET DES ETATS ---
-    # Si on arrive ici, l'action est validée (ou c'est l'IA).
-
-    # Mise à jour des arrivées et E/S réelles
-    ready_procs_real = []
-
-    for p in processes:
-        # Arrivées
         if p["state"] == "FUTURE" and p["arrival_time"] <= current_time:
             p["state"] = "READY"
             log.append(f"✨ T={current_time}: {p['pid']} est arrivé.")
             if p["pid"] not in rr_queue: rr_queue.append(p["pid"])
 
-        # E/S
+    # b. Retours E/S
+    for p in processes:
         if p["state"] == "WAITING":
             p["wait_time_remaining"] -= 1
-            if p["wait_time_remaining"] <= 0:
+            if p["wait_time_remaining"] > 0:
+                history.append({"Processus": p["pid"], "Début": current_time, "Fin": current_time + 1, "Type": "IO"})
+            else:
                 p["state"] = "READY"
                 log.append(f"🔙 T={current_time}: {p['pid']} revient d'E/S.")
                 if p["pid"] not in rr_queue: rr_queue.append(p["pid"])
-            else:
-                history.append({"Processus": p["pid"], "Début": current_time, "Fin": current_time + 1, "Type": "IO"})
 
-        # Reset RUNNING -> READY
-        if p["state"] == "RUNNING":
-            p["state"] = "READY"
+    # c. Reset Running
+    for p in processes:
+        if p["state"] == "RUNNING": p["state"] = "READY"
 
-        if p["state"] == "READY":
-            ready_procs_real.append(p)
+    ready_procs_real = [p for p in processes if p["state"] in ["READY"]]
+    unfinished = [p for p in processes if p["state"] != "TERMINATED"]
+    if not unfinished:
+        game_state["game_over"] = True
+        log.append(f"🏆 VICTOIRE ! Score Final: {score}")
+        return game_state
 
-    # SELECTION IA (Si pas manuel)
-    if mode == "AUTO":
+    # 2. CONFIGURATION REGLES
+    use_priority = 'PRIO' in rules
+    allow_preemption = 'PREEMPT' in rules
+    use_rr = 'RR' in rules
+
+    # 3. DECISION
+    chosen_proc = None
+    running_proc = next((p for p in processes if p["pid"] == game_state.get('last_pid')), None)
+    error_msg = None
+
+    if mode == "MANUAL":
+        if not selected_pid:
+            if ready_procs_real:
+                error_msg = "⛔ INTERDIT : Pas de temps mort (IDLE) autorisé !"
+        else:
+            candidate = next((p for p in processes if p["pid"] == selected_pid), None)
+            if not candidate or candidate not in ready_procs_real:
+                error_msg = f"⛔ {selected_pid} non dispo !"
+            elif use_rr:
+                valid_queue = [pid for pid in rr_queue if pid in [p['pid'] for p in ready_procs_real]]
+                if valid_queue and candidate["pid"] != valid_queue[0]:
+                    error_msg = f"⛔ ROUND ROBIN : Tour de {valid_queue[0]} !"
+            elif use_priority and not use_rr and ready_procs_real:
+                max_prio = max([p["priority"] for p in ready_procs_real])
+                if candidate["priority"] < max_prio:
+                    better = next(p for p in ready_procs_real if p["priority"] == max_prio)
+                    error_msg = f"⛔ PRIORITÉ : {better['pid']} est prioritaire ({better['priority']}) !"
+            elif not allow_preemption and running_proc and running_proc["state"] == "READY" and candidate["pid"] != \
+                    running_proc["pid"]:
+                error_msg = f"⛔ NON-PRÉEMPTION : Finissez {running_proc['pid']} !"
+
+            if not error_msg:
+                chosen_proc = candidate
+                score += 10
+
+    else:  # MODE AUTO
         if ready_procs_real:
-            # 1. Non-Préemption (Force Running)
-            # Retrouver l'ancien running (il est maintenant READY dans ready_procs_real)
-            # Astuce: on regarde si chosen_proc a déjà été défini par la logique de continuité ? Non.
-            # Il faut regarder consecutive_cpu > 0 et !RR pour deviner la continuité si on veut être strict,
-            # Mais simplifions : L'IA recalcule le meilleur candidat à chaque fois.
-
-            # Tri de base
             ready_procs_real.sort(key=lambda x: x["arrival_time"])
-
-            if use_priority:
-                ready_procs_real.sort(key=lambda x: x["priority"], reverse=True)
+            if use_priority: ready_procs_real.sort(key=lambda x: x["priority"], reverse=True)
 
             if use_rr:
-                valid_pids = [p["pid"] for p in ready_procs_real]
-                rr_queue = [pid for pid in rr_queue if pid in valid_pids]
-                if rr_queue:
-                    next_pid = rr_queue[0]
+                valid_queue = [pid for pid in rr_queue if pid in [p['pid'] for p in ready_procs_real]]
+                if valid_queue:
+                    next_pid = valid_queue[0]
                     chosen_proc = next((p for p in ready_procs_real if p["pid"] == next_pid), ready_procs_real[0])
                 else:
                     chosen_proc = ready_procs_real[0]
             else:
                 chosen_proc = ready_procs_real[0]
 
-            # Override Non-Preemption IA : Si un process tournait et n'a pas fini, et Preempt OFF
             if not allow_preemption and running_proc and running_proc in ready_procs_real:
                 chosen_proc = running_proc
 
-    # --- 4. EXECUTION ---
+    if error_msg:
+        lives -= 1
+        log.append(f"{error_msg} 💔")
+        if lives <= 0:
+            game_state["game_over"] = True
+            log.append("💀 GAME OVER")
+        game_state["lives"] = lives
+        game_state["log"] = log[-6:]
+        return game_state
+
+    # 4. EXECUTION
     if chosen_proc:
         chosen_proc["state"] = "RUNNING"
         chosen_proc["remaining_time"] -= 1
+        chosen_proc["executed_time"] += 1
         chosen_proc["consecutive_cpu"] += 1
 
-        # Logique E/S
-        if chosen_proc["remaining_time"] > 0 and random.random() < IO_PROBABILITY:
+        history.append({"Processus": chosen_proc["pid"], "Début": current_time, "Fin": current_time + 1, "Type": "CPU"})
+        log.append(f"⚡ T={current_time}: {chosen_proc['pid']} exécute.")
+
+        if chosen_proc["remaining_time"] <= 0:
+            chosen_proc["state"] = "TERMINATED"
+            chosen_proc["just_finished"] = True
+            score += 100
+            if chosen_proc["pid"] in rr_queue: rr_queue.remove(chosen_proc["pid"])
+            log.append(f"🎉 {chosen_proc['pid']} Fini !")
+
+        elif chosen_proc["executed_time"] in chosen_proc["io_plan"]:
             chosen_proc["state"] = "WAITING"
-            chosen_proc["wait_time_remaining"] = random.randint(1, MAX_IO_DURATION)
+            if chosen_proc.get("io_duration_fixed") and chosen_proc["io_duration_fixed"] > 0:
+                chosen_proc["wait_time_remaining"] = chosen_proc["io_duration_fixed"]
+            else:
+                chosen_proc["wait_time_remaining"] = random.randint(2, MAX_IO_DURATION)
             chosen_proc["consecutive_cpu"] = 0
-            if use_rr and chosen_proc["pid"] in rr_queue: rr_queue.remove(chosen_proc["pid"])
+            if chosen_proc["pid"] in rr_queue: rr_queue.remove(chosen_proc["pid"])
             log.append(f"⚠️ {chosen_proc['pid']} part en E/S.")
 
-        # Logique Round Robin (Quantum)
-        elif use_rr and chosen_proc["consecutive_cpu"] >= QUANTUM:
-            log.append(f"🔄 {chosen_proc['pid']} Quantum écoulé (Force Switch).")
-            chosen_proc["consecutive_cpu"] = 0
-            # Rotation File
+        elif use_rr:
             if chosen_proc["pid"] in rr_queue:
                 rr_queue.pop(0)
                 rr_queue.append(chosen_proc["pid"])
-            # NOTE : En mode manuel, l'utilisateur verra que le process s'arrête (devient READY).
-            # S'il essaie de le reprendre tout de suite, c'est techniquement possible sauf si on implémente une file stricte.
-            # Pour l'instant, on reset juste le CPU, ce qui indique visuellement la fin du tour.
-
-        # Fin
-        elif chosen_proc["remaining_time"] <= 0:
-            chosen_proc["state"] = "TERMINATED"
-            if use_rr and chosen_proc["pid"] in rr_queue: rr_queue.remove(chosen_proc["pid"])
-            log.append(f"🎉 {chosen_proc['pid']} a terminé !")
-
-        history.append({"Processus": chosen_proc["pid"], "Début": current_time, "Fin": current_time + 1, "Type": "CPU"})
-        if chosen_proc["state"] == "RUNNING":
-            log.append(f"⚡ T={current_time}: {chosen_proc['pid']} exécute.")
-
     else:
-        # IDLE
-        log.append("💤 CPU Inactif")
+        log.append("💤 IDLE")
         history.append({"Processus": "IDLE", "Début": current_time, "Fin": current_time + 1, "Type": "IDLE"})
 
     game_state["current_time"] += 1
     game_state["rr_queue"] = rr_queue
+    game_state["score"] = score
+    game_state["lives"] = lives
     game_state["log"] = log[-6:]
+    game_state["last_pid"] = chosen_proc["pid"] if chosen_proc else None
 
     return game_state
 
 
-# --- INTERFACE DASH ---
+# --- INTERFACE ---
 
 app = dash.Dash(__name__, external_stylesheets=['https://codepen.io/chriddyp/pen/bWLwgP.css'])
-app.title = "TP OS - Ordonnanceur"
+app.title = "Simulateur OS Ultimate"
 
-# Styles
-modal_style = {'position': 'fixed', 'zIndex': '1000', 'left': '0', 'top': '0', 'width': '100%', 'height': '100%',
-               'overflow': 'auto', 'backgroundColor': 'rgba(0,0,0,0.5)', 'display': 'none'}
-modal_content_style = {'backgroundColor': '#fefefe', 'margin': '15% auto', 'padding': '20px',
-                       'border': '1px solid #888', 'width': '50%', 'borderRadius': '10px'}
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            @keyframes boom { 0% { transform: scale(0.5); opacity: 1; } 100% { transform: scale(2.5); opacity: 0; } }
+            .explosion { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 4rem; animation: boom 0.5s forwards; pointer-events: none; }
+            .no-select { user-select: none; }
+        </style>
+    </head>
+    <body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body>
+</html>
+'''
 
 app.layout = html.Div([
-    # MODALE
-    html.Div(id='rules-modal', style=modal_style, children=[
-        html.Div(style=modal_content_style, children=[
-            html.H3("Règles du Jeu"),
-            html.P("Les règles cochées s'appliquent à l'IA ET au joueur (Mode Manuel) !"),
-            html.Ul([
-                html.Li("★ Priorité : Impossible de choisir un petit process si un gros attend."),
-                html.Li("🚫 Non-Préemption : Impossible de changer de process tant qu'il n'a pas fini (ou E/S)."),
-                html.Li("🔄 Round Robin : Au bout de 3 ticks, le process est éjecté."),
-            ]),
-            html.Button("OK", id='btn-close-modal', className='button')
-        ])
-    ]),
+    dcc.Store(id='game-store', data=generate_initial_state(count=6)),
+    dcc.Interval(id='auto-timer', interval=600, disabled=True),
 
-    # HEADER
+    html.H1("⚡ Simulateur d'Ordonnancement", style={'textAlign': 'center'}),
+
     html.Div([
-        html.H1("⚡ Jeu de l'Ordonnanceur (Strict Mode)", style={'display': 'inline-block'}),
-        html.Button("❓ Règles", id='btn-open-modal', className='button', style={'float': 'right', 'marginTop': '20px'})
-    ], style={'borderBottom': '1px solid #ddd', 'marginBottom': '20px'}),
+        # Zone Upload
+        dcc.Upload(id='upload-data', children=html.Div(['📂 Glissez un fichier .txt']),
+                   style={'width': '100%', 'height': '60px', 'lineHeight': '60px', 'borderWidth': '1px',
+                          'borderStyle': 'dashed', 'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0',
+                          'backgroundColor': '#fff', 'cursor': 'pointer'}, multiple=False),
 
-    dcc.Store(id='game-store', data=generate_initial_state()),
-    dcc.Interval(id='auto-timer', interval=800, disabled=True),
-
-    # MAIN
-    html.Div([
-        # GAUCHE
+        # Zone Configuration Aléatoire
         html.Div([
-            html.H5("⚙️ Règles Actives"),
-            dcc.Checklist(
-                id='rules-checklist',
-                options=[
-                    {'label': ' Respecter Priorités', 'value': 'PRIO'},
-                    {'label': ' Non-Préemption (Strict)', 'value': 'PREEMPT_OFF'},
-                    # Changé pour clarifier: si coché, pas de préemption
-                    {'label': ' Round Robin (Quantum)', 'value': 'RR'}
-                ],
-                value=[],
-                labelStyle={'display': 'block', 'cursor': 'pointer'}
-            ),
-            html.Div("Note: Cochez 'Non-Préemption' pour interdire le changement de tâche.",
-                     style={'fontSize': '0.8em', 'color': '#666', 'marginBottom': '10px'}),
-            html.Hr(),
+            html.Label("Nombre de processus :", style={'fontWeight': 'bold', 'marginRight': '10px'}),
+            dcc.Input(id='num-procs', type='number', value=6, min=2, max=20, step=1,
+                      style={'width': '60px', 'marginRight': '10px'}),
+            html.Button("🎲 Générer", id='btn-generate', className='button-primary')
+        ], style={'textAlign': 'center', 'margin': '15px 0', 'padding': '10px', 'backgroundColor': '#f9f9f9',
+                  'borderRadius': '5px'}),
 
-            html.H5("🕹️ Contrôles"),
-            html.Button("🔄 Reset", id='btn-reset', className='button', style={'width': '100%', 'marginBottom': '5px'}),
+        html.Div(id='stats-display',
+                 style={'textAlign': 'center', 'fontSize': '1.5em', 'fontWeight': 'bold', 'margin': '10px'}),
 
-            html.Label("Joueur (Manuel) :"),
-            dcc.Dropdown(id='proc-dropdown', placeholder="Votre choix..."),
-            html.Button("▶️ Valider Choix (+1 Tick)", id='btn-step', className='button-primary',
-                        style={'width': '100%', 'marginTop': '5px'}),
-
-            html.Hr(),
-            html.Label("IA (Auto) :"),
-            html.Button("⏯️ Start / Stop Auto", id='btn-auto', className='button', style={'width': '100%'}),
-
-            html.Hr(),
-            html.H2(id='time-display', style={'textAlign': 'center', 'color': '#0074D9'})
-
-        ], className='three columns', style={'backgroundColor': '#f1f1f1', 'padding': '20px', 'borderRadius': '8px'}),
-
-        # DROITE
         html.Div([
-            html.Div(id='procs-container',
-                     style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '20px',
-                            'justifyContent': 'center'}),
-            dcc.Graph(id='gantt-chart', config={'displayModeBar': False}),
-            html.H6("Journal système (Logs) :"),
-            html.Div(id='log-console', style={'backgroundColor': '#1e1e1e', 'color': '#00ff00', 'padding': '10px',
-                                              'fontFamily': 'Consolas, monospace', 'height': '150px',
-                                              'overflowY': 'scroll', 'borderRadius': '5px'})
-        ], className='nine columns')
-    ], className='row')
+            dcc.Checklist(id='rules-checklist', options=[{'label': ' Priorités', 'value': 'PRIO'},
+                                                         {'label': ' Non-Préemption', 'value': 'PREEMPT_OFF'},
+                                                         {'label': ' Round Robin', 'value': 'RR'}], value=[],
+                          labelStyle={'display': 'inline-block', 'marginRight': '15px'}),
+        ], style={'textAlign': 'center', 'marginBottom': '20px'}),
 
-], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'})
+        html.Div([
+            html.Button("🔄 Rejouer (Reset)", id='btn-reset', className='button', style={'marginRight': '10px'}),
+            html.Button("⏯️ IA Auto", id='btn-auto', className='button'),
+            html.Button("▶️ Passer Tick", id='btn-step', className='button', style={'marginLeft': '10px'})
+        ], style={'textAlign': 'center', 'marginBottom': '20px'}),
+
+        html.H2(id='time-display', style={'textAlign': 'center', 'color': '#0074D9'}),
+
+        html.Div(id='procs-container',
+                 style={'display': 'flex', 'gap': '10px', 'justifyContent': 'center', 'flexWrap': 'wrap',
+                        'marginBottom': '20px'}),
+
+        dcc.Graph(id='gantt-chart', config={'displayModeBar': False}),
+
+        html.H6("Logs :"),
+        html.Div(id='log-console',
+                 style={'backgroundColor': '#222', 'color': '#0f0', 'padding': '10px', 'height': '150px',
+                        'overflowY': 'scroll', 'fontFamily': 'monospace'})
+    ], style={'maxWidth': '1200px', 'margin': '0 auto'})
+])
 
 
-# CALLBACKS
-@app.callback(Output('rules-modal', 'style'), Input('btn-open-modal', 'n_clicks'), Input('btn-close-modal', 'n_clicks'),
-              State('rules-modal', 'style'))
-def toggle_modal(n1, n2, s):
-    return {'display': 'block'} if ctx.triggered_id == 'btn-open-modal' else {'display': 'none'}
-
+# --- CALLBACKS ---
 
 @app.callback(
-    Output('game-store', 'data'),
-    Output('auto-timer', 'disabled'),
-    Output('btn-auto', 'children'),
-    Input('btn-reset', 'n_clicks'),
-    Input('btn-step', 'n_clicks'),
-    Input('auto-timer', 'n_intervals'),
-    Input('btn-auto', 'n_clicks'),
-    State('game-store', 'data'),
-    State('proc-dropdown', 'value'),
-    State('rules-checklist', 'value'),
-    State('auto-timer', 'disabled')
+    Output('game-store', 'data'), Output('auto-timer', 'disabled'), Output('btn-auto', 'children'),
+    Input('btn-generate', 'n_clicks'), Input('btn-reset', 'n_clicks'), Input('upload-data', 'contents'),
+    Input({'type': 'proc-card', 'index': ALL}, 'n_clicks'), Input('auto-timer', 'n_intervals'),
+    Input('btn-auto', 'n_clicks'), Input('btn-step', 'n_clicks'),
+    State('game-store', 'data'), State('rules-checklist', 'value'), State('auto-timer', 'disabled'),
+    State('num-procs', 'value')
 )
-def update_game_logic(reset, step, timer, auto_click, data, selected_pid, rules, is_timer_disabled):
+def game_loop(gen_click, reset_click, upload_content, card_clicks, timer, auto_click, step_click, data, rules,
+              is_timer_disabled, num_procs):
     trigger = ctx.triggered_id
-    if trigger == 'btn-reset': return generate_initial_state(), True, "⏯️ Start Auto"
 
+    # 1. Génération Nouvelle Partie Aléatoire
+    if trigger == 'btn-generate':
+        return generate_initial_state(count=num_procs), True, "⏯️ IA Auto"
+
+    # 2. Upload Fichier
+    if trigger == 'upload-data' and upload_content:
+        procs = parse_uploaded_file(upload_content)
+        if procs: return generate_initial_state(processes=procs), True, "⏯️ IA Auto"
+
+    # 3. Reset (Rejouer la même)
+    if trigger == 'btn-reset':
+        import copy
+        initial = copy.deepcopy(data.get("initial_setup"))
+        return generate_initial_state(processes=initial), True, "⏯️ IA Auto"
+
+    # 4. Auto Mode
     if trigger == 'btn-auto':
-        return data, not is_timer_disabled, "⏸️ Stop" if is_timer_disabled else "⏯️ Start Auto"
+        return data, not is_timer_disabled, "⏸️ Stop" if is_timer_disabled else "⏯️ IA Auto"
 
-    if trigger == 'btn-step' or trigger == 'auto-timer':
+    # 5. Game Loop (Tick)
+    is_tick = trigger == 'auto-timer' or trigger == 'btn-step' or (
+                isinstance(trigger, dict) and trigger.get('type') == 'proc-card')
+
+    if is_tick:
         if data["game_over"]: return data, True, "🏁 Terminé"
 
         mode = "AUTO" if trigger == 'auto-timer' else "MANUAL"
-
-        # Adaptation des règles pour la fonction logique
-        # Dans l'UI j'ai mis "Non-Préemption" (PREEMPT_OFF) pour que ce soit plus clair à cocher
-        # Donc si PREEMPT_OFF est coché, allow_preemption = False
         logic_rules = []
         if rules and 'PRIO' in rules: logic_rules.append('PRIO')
         if rules and 'RR' in rules: logic_rules.append('RR')
+        if not (rules and 'PREEMPT_OFF' in rules): logic_rules.append('PREEMPT')
 
-        # La logique process_step attend 'PREEMPT' pour AUTORISER.
-        # Si 'PREEMPT_OFF' est coché, on n'envoie PAS 'PREEMPT'.
-        # Si 'PREEMPT_OFF' n'est pas coché, on envoie 'PREEMPT'.
-        if not (rules and 'PREEMPT_OFF' in rules):
-            logic_rules.append('PREEMPT')
+        selected_pid = trigger['index'] if isinstance(trigger, dict) else None
 
         new_data = process_step(data, selected_pid, mode, logic_rules)
         return new_data, False if mode == "AUTO" else True, dash.no_update
 
-    return data, True, "⏯️ Start Auto"
+    return data, True, "⏯️ IA Auto"
 
 
 @app.callback(
-    Output('time-display', 'children'),
-    Output('procs-container', 'children'),
-    Output('gantt-chart', 'figure'),
-    Output('proc-dropdown', 'options'),
-    Output('log-console', 'children'),
-    Input('game-store', 'data'),
-    State('rules-checklist', 'value')
+    Output('time-display', 'children'), Output('stats-display', 'children'),
+    Output('procs-container', 'children'), Output('gantt-chart', 'figure'), Output('log-console', 'children'),
+    Input('game-store', 'data'), State('rules-checklist', 'value')
 )
-def update_ui_components(data, rules):
+def update_view(data, rules):
     show_prio = rules and 'PRIO' in rules
-
-    time_txt = f"⏱️ T={data['current_time']}"
-    cards, ready_opts = [], []
+    cards = []
     state_colors = {"FUTURE": "#BDC3C7", "READY": "#F1C40F", "RUNNING": "#2ECC71", "WAITING": "#3498DB",
                     "TERMINATED": "#E74C3C"}
 
     for p in data["processes"]:
-        b_color = state_colors.get(p["state"], "#333")
-        border = f"3px solid {b_color}" if p["state"] == "RUNNING" else "1px solid #ccc"
-        prio_html = html.Span(f"★{p['priority']}", style={'float': 'right', 'color': '#E67E22',
-                                                          'fontWeight': 'bold'}) if show_prio else html.Span("")
+        bc = state_colors.get(p["state"], "#333")
+        border = f"4px solid {bc}" if p["state"] in ["READY", "RUNNING"] else f"1px solid {bc}"
+        prio = html.Span(f"★{p['priority']}",
+                         style={'float': 'right', 'color': '#E67E22', 'fontWeight': 'bold'}) if show_prio else ""
+
+        io_info = f"E/S: {p['io_duration_fixed']}s" if p.get('io_duration_fixed') else (
+            f"E/S: {', '.join(map(str, p['io_plan']))}" if p['io_plan'] else "Pas d'E/S")
+        expl = html.Div("💥", className="explosion") if p.get('just_finished') else None
 
         card = html.Div([
-            html.Div([html.Span(p['pid'], style={'fontWeight': 'bold'}), prio_html], style={'marginBottom': '5px'}),
+            expl,
+            html.Div([html.Span(p['pid'], style={'fontWeight': 'bold'}), prio], style={'marginBottom': '5px'}),
             html.Div(p['state'],
-                     style={'color': 'white', 'backgroundColor': b_color, 'borderRadius': '3px', 'padding': '2px',
-                            'fontSize': '0.8em'}),
-            html.Div(f"Burst: {p['burst_time']}", style={'fontSize': '0.9em'}),
-            html.Div(f"Reste: {p['remaining_time']}", style={'fontWeight': 'bold'}),
-            html.Div(f"E/S: {p['wait_time_remaining']}s" if p['state'] == "WAITING" else "",
+                     style={'backgroundColor': bc, 'color': 'white', 'borderRadius': '3px', 'fontSize': '0.8em'}),
+            html.Div(f"Reste: {p['remaining_time']}", style={'fontWeight': 'bold', 'marginTop': '5px'}),
+            html.Div(io_info, style={'fontSize': '0.7em', 'color': '#666'}),
+            html.Div(f"Attente: {p['wait_time_remaining']}s" if p['state'] == "WAITING" else "",
                      style={'color': '#3498DB', 'fontSize': '0.8em'})
-        ], style={'border': border, 'borderRadius': '8px', 'padding': '10px', 'width': '100px', 'textAlign': 'center',
-                  'backgroundColor': 'white', 'boxShadow': "0 4px 8px 0 rgba(0,0,0,0.2)"})
+        ], id={'type': 'proc-card', 'index': p['pid']}, className='no-select',
+            style={'border': border, 'borderRadius': '8px', 'padding': '10px', 'width': '120px', 'textAlign': 'center',
+                   'backgroundColor': 'white', 'cursor': 'pointer', 'position': 'relative', 'overflow': 'hidden'})
         cards.append(card)
-        if p['state'] == 'READY':
-            label = f"{p['pid']} (Prio {p['priority']})" if show_prio else p['pid']
-            ready_opts.append({'label': label, 'value': p['pid']})
 
     if data["history"]:
         df = pd.DataFrame(data["history"])
-        # Couleur dynamique selon PID
-        fig = px.bar(df, x="Fin", y="Processus", color="Processus", orientation='h', base="Début",
-                     range_x=[0, max(15, data["current_time"] + 2)], title="Diagramme de Gantt")
+        df["Delta"] = df["Fin"] - df["Début"]
+        fig = px.bar(df, x="Delta", y="Processus", base="Début", color="Processus",
+                     pattern_shape="Type", pattern_shape_map={"CPU": "", "IO": "/", "IDLE": "."},
+                     orientation='h', range_x=[0, max(20, data["current_time"] + 2)],
+                     title="Diagramme de Gantt (Plein=CPU, Rayé=E/S)")
         fig.update_layout(height=300, margin=dict(l=20, r=20, t=30, b=20), plot_bgcolor='rgba(0,0,0,0)')
+        fig.update_traces(marker_line_color='black', marker_line_width=0.5)
     else:
         fig = px.bar(title="En attente...")
 
-    logs = []
-    for l in reversed(data["log"]):
-        style = {'borderBottom': '1px solid #333'}
-        if "⛔" in l: style['color'] = '#FF4136'  # Rouge pour erreurs
-        logs.append(html.Div(l, style=style))
+    logs = [html.Div(l, style={'color': '#FF4136' if '⛔' in l else '#0f0', 'borderBottom': '1px solid #333'}) for l in
+            reversed(data["log"])]
+    stats = f"{'❤️' * data.get('lives', 3)} | Score: {data.get('score', 0)}"
 
-    return time_txt, cards, fig, ready_opts, logs
+    return f"⏱️ T={data['current_time']}", stats, cards, fig, logs
 
 
 if __name__ == '__main__':
